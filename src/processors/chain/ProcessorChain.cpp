@@ -48,9 +48,28 @@ ProcessorChain::ProcessorChain (ProcessorStore& store,
     portMagsHelper = std::make_unique<ProcessorChainPortMagnitudesHelper> (*this);
 
     procs.ensureStorageAllocated (100);
+    connections.reserve (100);
+    renderPlan.entries.reserve (100);
 }
 
 ProcessorChain::~ProcessorChain() = default;
+
+BaseProcessor* ProcessorChain::getProcessorByID (ProcessorID id)
+{
+    if (inputProcessor.getID() == id)
+        return &inputProcessor;
+
+    if (outputProcessor.getID() == id)
+        return &outputProcessor;
+
+    for (auto* proc : procs)
+    {
+        if (proc->getID() == id)
+            return proc;
+    }
+
+    return nullptr;
+}
 
 void ProcessorChain::createParameters (Parameters& params)
 {
@@ -268,6 +287,97 @@ void ProcessorChain::parameterChanged (const juce::String& /*parameterID*/, floa
                                if (! presetManager->getIsDirty())
                                    presetManager->setIsDirty (true); },
                            true);
+}
+
+void ProcessorChain::fillPlan()
+{
+    renderPlan.entries.clear();
+    renderPlan.reachesOutput = false;
+
+    const auto countConnectionsFrom = [this] (const BaseProcessor* proc)
+    {
+        return (int) std::count_if (connections.begin(), connections.end(), [id = proc->getID()] (const Connection& connection)
+                                    { return connection.sourceProcessor == id; });
+    };
+
+    const auto countConnectionsTo = [this] (const BaseProcessor* proc)
+    {
+        return (int) std::count_if (connections.begin(), connections.end(), [id = proc->getID()] (const Connection& connection)
+                                    { return connection.destinationProcessor == id; });
+    };
+
+    const auto isModulationOutputConnected = [this] (const BaseProcessor* proc)
+    {
+        if (proc->getProcessorType() != Modulation)
+            return false;
+
+        return std::any_of (connections.begin(), connections.end(), [proc] (const Connection& connection)
+                            { return connection.sourceProcessor == proc->getID() && proc->getOutputPortType (connection.sourcePort) == PortType::modulation; });
+    }; 
+
+    std::unordered_map<const BaseProcessor*, int> numInputsDelivered;
+
+    // this must visit the processors in the same order as runProcessor()
+    const auto visitProcessor = [&] (auto&& self, BaseProcessor* proc) -> void
+    {
+        if (proc == &outputProcessor) // we've reached the output processor, so we're done!
+        {
+            renderPlan.entries.push_back ({ proc });
+            renderPlan.reachesOutput = true;
+            return;
+        }
+
+        const auto numOutputs = proc->getNumOutputs();
+        if (numOutputs == 0) // this processor has no outputs, so after we process, we're done!
+        {
+            renderPlan.entries.push_back ({ proc });
+            return;
+        }
+
+        int numAudioOutputs = 0;
+        for (int portIdx = 0; portIdx < numOutputs; ++portIdx)
+            numAudioOutputs += proc->getOutputPortType (portIdx) == PortType::audio ? 1 : 0;
+
+        if (countConnectionsFrom (proc) == 0 && numAudioOutputs > 0) // the output of this processor is connected to nothing, so it doesn't run
+            return;
+
+        renderPlan.entries.push_back ({ proc });
+
+        for (int portIdx = 0; portIdx < numOutputs; ++portIdx)
+        {
+            // the connections on each port are visited from the most recently added to the least
+            for (auto connection = connections.rbegin(); connection != connections.rend(); ++connection)
+            {
+                if (connection->sourceProcessor != proc->getID() || connection->sourcePort != portIdx)
+                    continue;
+
+                auto* nextProc = getProcessorByID (connection->destinationProcessor);
+                if (nextProc == nullptr)
+                {
+                    jassertfalse; // the connection table has a processor that isn't in the chain!
+                    continue;
+                }
+
+                if (nextProc->getNumInputs() != 1)
+                {
+                    if (++numInputsDelivered[nextProc] < countConnectionsTo (nextProc))
+                        continue; // not all the inputs are ready yet...
+                }
+
+                self (self, nextProc);
+            }
+        }
+    };
+
+    // standalone modulation processors
+    for (auto* proc : procs)
+    {
+        const auto noInputsConnected = countConnectionsTo (proc) == 0;
+        if (noInputsConnected && (isModulationOutputConnected (proc) || proc->onlyHasModulationOutput()))
+            visitProcessor (visitProcessor, proc);
+    }
+
+    visitProcessor (visitProcessor, &inputProcessor);
 }
 
 size_t ProcessorChain::getRequiredArenaSizeBytes()

@@ -1,0 +1,8 @@
+Code re-structuring
+Right now everything is very object-oriented
+Adding/changing anything requires editing the “common interface”. I want to fix that and make it more Data-oriented
+Data-level interface, easier to opt-in/out
+Reducing memory usage (scratch memory)
+Multi-threaded processing
+Sync between DSP and UI is crude
+Improve data flow(?) and thread communication

@@ -27,3 +27,6 @@ xcode/
 sim/**/*.wav
 *.asd
 *.mp4
+
+# local notes
+/plan.txt

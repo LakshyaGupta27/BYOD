@@ -1,0 +1,5 @@
+Undo by ID instead of by pointer
+
+Each processor gets a ProcessorID (BaseProcessor) and the chain can look it up with getProcessorByID (ProcessorChain)
+
+AddOrRemoveProcessor/Connection store IDs and look up the processors insteadd of using pointers (ProcessorChainActions.h)

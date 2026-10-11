@@ -3,6 +3,16 @@
 #include "netlist_helpers/NetlistViewer.h"
 #include "state/ParamForwardManager.h"
 
+Connection toConnection (const ConnectionInfo& info)
+{
+    return {
+        info.startProc->getID(),
+        info.startPort,
+        info.endProc->getID(),
+        info.endPort,
+    };
+}
+
 BaseProcessor::BaseProcessor (const String& name,
                               ParamLayout params,
                               UndoManager* um) : BaseProcessor (
@@ -42,6 +52,12 @@ BaseProcessor::BaseProcessor (const String& name,
 }
 
 BaseProcessor::~BaseProcessor() = default;
+
+ProcessorID BaseProcessor::createID()
+{
+    static std::atomic<uint64_t> idCounter { 0 };
+    return ProcessorID { ++idCounter };
+}
 
 void BaseProcessor::prepareProcessing (double sampleRate, int numSamples)
 {

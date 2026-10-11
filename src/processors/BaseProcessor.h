@@ -33,9 +33,27 @@ struct ProcessorUIOptions
     } info;
 };
 
+/**
+ * Identifies a processor for as long as it exists, whether or not it is currently in the chain.
+ * IDs are not saved with the plugin state.
+ */
+enum class ProcessorID : uint64_t
+{
+};
+
 class BaseProcessor;
 class ProcessorEditor;
 struct PlayheadHelpers;
+
+struct Connection
+{
+    ProcessorID sourceProcessor;
+    int sourcePort;
+    ProcessorID destinationProcessor;
+    int destinationPort;
+    bool operator== (const Connection&) const = default;
+};
+
 namespace netlist
 {
 struct CircuitQuantityList;
@@ -47,6 +65,9 @@ struct ConnectionInfo
     BaseProcessor* endProc;
     int endPort;
 };
+
+/** Returns the connection table row for this connection. */
+Connection toConnection (const ConnectionInfo& info);
 
 namespace base_processor_detail
 {
@@ -118,6 +139,7 @@ public:
     // metadata
     virtual ProcessorType getProcessorType() const = 0;
     const String getName() const override { return JuceProcWrapper::getName(); }
+    ProcessorID getID() const noexcept { return id; }
 
     // audio processing methods
     bool isBypassed() const { return ! static_cast<bool> (onOffParam->load()); }
@@ -292,6 +314,9 @@ private:
                    base_processor_detail::PortTypesVector&& inputPortTypes,
                    base_processor_detail::PortTypesVector&& outputPortTypes,
                    UndoManager* um);
+
+    static ProcessorID createID();
+    const ProcessorID id = createID();
 
     std::atomic<float>* onOffParam = nullptr;
 

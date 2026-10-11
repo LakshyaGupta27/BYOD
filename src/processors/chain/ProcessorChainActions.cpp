@@ -78,9 +78,11 @@ public:
         if (needsNewArena)
             arenaData = chain.allocArena (arenaBytes);
 
+        const auto connection = toConnection (info);
         {
             SpinLock::ScopedLockType scopedProcessingLock { chain.processingLock };
             info.startProc->addConnection (ConnectionInfo (info));
+            chain.connections.push_back (connection);
             if (needsNewArena)
                 std::swap (arenaData, chain.arena.get_memory_resource());
         }
@@ -101,9 +103,16 @@ public:
         if (needsNewArena)
             arenaData = chain.allocArena (arenaBytes);
 
+        const auto connection = toConnection (info);
         {
             SpinLock::ScopedLockType scopedProcessingLock { chain.processingLock };
             info.startProc->removeConnection (info);
+
+            if (auto iter = std::find (chain.connections.begin(), chain.connections.end(), connection); iter != chain.connections.end())
+                chain.connections.erase (iter);
+            else
+                jassertfalse; // the connection table is out of sync with the processors!
+
             if (needsNewArena)
                 std::swap (arenaData, chain.arena.get_memory_resource());
         }
@@ -126,13 +135,14 @@ private:
 //=========================================================
 AddOrRemoveProcessor::AddOrRemoveProcessor (ProcessorChain& procChain, BaseProcessor::Ptr newProc) : chain (procChain),
                                                                                                      actionProc (std::move (newProc)),
+                                                                                                     actionProcID (actionProc != nullptr ? actionProc->getID() : ProcessorID {}),
                                                                                                      isRemoving (false),
                                                                                                      wasDirty (ProcChainActions::getPresetWasDirty (chain))
 {
 }
 
 AddOrRemoveProcessor::AddOrRemoveProcessor (ProcessorChain& procChain, BaseProcessor* procToRemove) : chain (procChain),
-                                                                                                      actionProcPtr (procToRemove),
+                                                                                                      actionProcID (procToRemove != nullptr ? procToRemove->getID() : ProcessorID {}),
                                                                                                       isRemoving (true),
                                                                                                       wasDirty (ProcChainActions::getPresetWasDirty (chain))
 {
@@ -158,11 +168,11 @@ bool AddOrRemoveProcessor::perform()
 {
     if (isRemoving)
     {
-        if (! waitForPointerCheck (actionProcPtr))
+        auto* procToRemove = chain.getProcessorByID (actionProcID);
+        if (procToRemove == nullptr)
             return false;
 
-        jassert (actionProcPtr != nullptr);
-        ProcChainActions::removeProcessor (chain, actionProcPtr, actionProc);
+        ProcChainActions::removeProcessor (chain, procToRemove, actionProc);
     }
     else
     {
@@ -170,7 +180,6 @@ bool AddOrRemoveProcessor::perform()
             return false;
 
         jassert (actionProc != nullptr);
-        actionProcPtr = actionProc.get();
         ProcChainActions::addProcessor (chain, std::move (actionProc));
     }
 
@@ -188,16 +197,15 @@ bool AddOrRemoveProcessor::undo()
             return false;
 
         jassert (actionProc != nullptr);
-        actionProcPtr = actionProc.get();
         ProcChainActions::addProcessor (chain, std::move (actionProc));
     }
     else
     {
-        if (! waitForPointerCheck (actionProcPtr))
+        auto* procToRemove = chain.getProcessorByID (actionProcID);
+        if (procToRemove == nullptr)
             return false;
 
-        jassert (actionProcPtr != nullptr);
-        ProcChainActions::removeProcessor (chain, actionProcPtr, actionProc);
+        ProcChainActions::removeProcessor (chain, procToRemove, actionProc);
     }
 
     if (! wasDirty)
@@ -208,14 +216,32 @@ bool AddOrRemoveProcessor::undo()
 
 //=========================================================
 AddOrRemoveConnection::AddOrRemoveConnection (ProcessorChain& procChain, ConnectionInfo&& cInfo, bool removing) : chain (procChain),
-                                                                                                                  info (cInfo),
+                                                                                                                  startProcID (cInfo.startProc->getID()),
+                                                                                                                  startPort (cInfo.startPort),
+                                                                                                                  endProcID (cInfo.endProc->getID()),
+                                                                                                                  endPort (cInfo.endPort),
                                                                                                                   isRemoving (removing),
                                                                                                                   wasDirty (ProcChainActions::getPresetWasDirty (chain))
 {
 }
 
+bool AddOrRemoveConnection::getConnectionInfo (ConnectionInfo& info) const
+{
+    auto* startProc = chain.getProcessorByID (startProcID);
+    auto* endProc = chain.getProcessorByID (endProcID);
+    if (startProc == nullptr || endProc == nullptr)
+        return false;
+
+    info = { startProc, startPort, endProc, endPort };
+    return true;
+}
+
 bool AddOrRemoveConnection::perform()
 {
+    ConnectionInfo info {};
+    if (! getConnectionInfo (info))
+        return false;
+
     if (isRemoving)
     {
         ProcChainActions::removeConnection (chain, info);
@@ -233,6 +259,10 @@ bool AddOrRemoveConnection::perform()
 
 bool AddOrRemoveConnection::undo()
 {
+    ConnectionInfo info {};
+    if (! getConnectionInfo (info))
+        return false;
+
     if (isRemoving)
     {
         ProcChainActions::addConnection (chain, info);

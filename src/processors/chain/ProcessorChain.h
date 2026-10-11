@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../ProcessorStore.h"
+#include "RenderPlan.h"
 #include "ChainIOProcessor.h"
 
 #include "../utility/InputProcessor.h"
@@ -28,10 +29,16 @@ public:
 
     auto& getProcessors() { return procs; }
     const auto& getProcessors() const { return procs; }
+    const auto& getConnections() const { return connections; }
+    const auto& getRenderPlan() const { return renderPlan; }
+
     ProcessorStore& getProcStore() { return procStore; }
 
     InputProcessor& getInputProcessor() { return inputProcessor; }
     OutputProcessor& getOutputProcessor() { return outputProcessor; }
+
+    /** Returns the processor with this ID if it is currently in the chain (including the input/output processors), or nullptr. */
+    BaseProcessor* getProcessorByID (ProcessorID id);
 
     auto& getActionHelper() { return *actionHelper; }
     auto& getStateHelper() { return *stateHelper; }
@@ -53,9 +60,12 @@ private:
     void initializeProcessors();
     void runProcessor (BaseProcessor* proc, AudioBuffer<float>& buffer, bool& outProcessed);
     void parameterChanged (const juce::String& parameterID, float newValue) override;
+    void fillPlan();
 
     double mySampleRate = 48000.0;
     int mySamplesPerBlock = 512;
+    std::vector<Connection> connections;
+    RenderPlan renderPlan;
 
     OwnedArray<BaseProcessor> procs;
     ProcessorStore& procStore;

@@ -19,8 +19,8 @@ public:
 
 private:
     ProcessorChain& chain;
-    BaseProcessor::Ptr actionProc;
-    BaseProcessor* actionProcPtr = nullptr;
+    BaseProcessor::Ptr actionProc; // holds the processor while it is out of the chain
+    const ProcessorID actionProcID;
 
     const bool isRemoving;
     const bool wasDirty;
@@ -38,8 +38,14 @@ public:
     int getSizeInUnits() override { return 1; }
 
 private:
+    /** Looks up the connection's processors in the chain. Returns false if either one is not in the chain. */
+    bool getConnectionInfo (ConnectionInfo& info) const;
+
     ProcessorChain& chain;
-    const ConnectionInfo info;
+    const ProcessorID startProcID;
+    const int startPort;
+    const ProcessorID endProcID;
+    const int endPort;
     const bool isRemoving;
     const bool wasDirty;
 
