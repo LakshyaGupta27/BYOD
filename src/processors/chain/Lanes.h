@@ -1,7 +1,11 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
 #include <thread>
+#include <vector>
 
 /**
  * Multi-core helpers, based on Ryan Fleury's "Multi-Core By Default":
@@ -43,6 +47,7 @@ private:
 struct LaneContext
 {
     int index = 0;
+    Barrier* barrier = nullptr;
 };
 
 // a thread that isn't part of a group acts like a group with one lane
@@ -50,4 +55,59 @@ inline thread_local LaneContext laneContext;
 
 /** Returns the index of the lane that we're running on. */
 inline int LaneIdx() noexcept { return laneContext.index; }
+
+/** Waits here until all the other lanes in the group have arrived. */
+inline void LaneSync()
+{
+    if (laneContext.barrier != nullptr)
+        laneContext.barrier->wait();
+}
+
+/** A group of lanes. The threads are created once and then sleep until there is a task to run. */
+class LaneGroup
+{
+public:
+    ~LaneGroup() { stop(); }
+
+    /** The thread that calls run() is lane 0, so this makes (numLanes - 1) threads. */
+    void start (int numLanes)
+    {
+        stop();
+
+        barrier = std::make_unique<Barrier> (numLanes);
+        shouldStop = false;
+
+        for (int laneIndex = 1; laneIndex < numLanes; ++laneIndex)
+            threads.emplace_back ([this, laneIndex] { threadLoop (laneIndex); });
+    }
+
+    void stop()
+    {
+        {
+            const std::lock_guard lock { mutex };
+            shouldStop = true;
+        }
+        wakeUp.notify_all();
+
+        for (auto& thread : threads)
+            thread.join();
+        threads.clear();
+    }
+
+    bool isRunning() const noexcept { return ! threads.empty(); }
+
+private:
+    void threadLoop (int laneIndex) // laneIndex gets used in the next step
+    {
+        std::unique_lock lock { mutex };
+        wakeUp.wait (lock, [this] { return shouldStop; });
+    }
+
+    std::unique_ptr<Barrier> barrier;
+    std::vector<std::thread> threads;
+
+    std::mutex mutex;
+    std::condition_variable wakeUp;
+    bool shouldStop = false;
+};
 } // namespace lanes
