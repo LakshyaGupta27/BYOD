@@ -3,6 +3,7 @@
 #include "../ProcessorStore.h"
 #include "RenderPlan.h"
 #include "ChainIOProcessor.h"
+#include "Lanes.h"
 
 #include "../utility/InputProcessor.h"
 #include "../utility/OutputProcessor.h"
@@ -58,7 +59,9 @@ public:
 
 private:
     void initializeProcessors();
-    void runProcessor (BaseProcessor* proc, AudioBuffer<float>& buffer, bool& outProcessed);
+    void runProcessor (const RenderPlanEntry& entry);
+    void sendOutputsToNextProcessors (BaseProcessor* proc, AudioBuffer<float>& buffer, DSPArena& laneArena);
+    void renderOnLane();
     void parameterChanged (const juce::String& parameterID, float newValue) override;
     void fillPlan();
 
@@ -100,6 +103,18 @@ private:
 
     int connectionsCount {};
     DSPArena arena {};
+
+    // the number of threads that we use for processing (including the audio thread)
+    static constexpr int numLanes = 4;
+    lanes::LaneGroup laneGroup;
+    std::array<DSPArena, (size_t) numLanes> laneArenas {};
+    std::function<void()> renderTask;
+    std::atomic<int> nextEntryToRun { 0 };
+
+    // for debugging
+    std::FILE* laneLogFile = nullptr;
+    bool isLoggingThisBlock = false;
+    int numBlocksProcessed = 0;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (ProcessorChain)
 };

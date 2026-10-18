@@ -19,6 +19,7 @@ target_sources(BYOD_headless PRIVATE
     tests/AmpIRsSaveLoadTest.cpp
     tests/BadModulationTest.cpp
     tests/ForwardingParamStabilityTest.cpp
+    tests/LanesTest.cpp
     tests/NaNResetTest.cpp
     tests/ParameterSmoothTest.cpp
     tests/PreBufferTest.cpp
@@ -26,6 +27,7 @@ target_sources(BYOD_headless PRIVATE
     tests/PresetSearchTest.cpp
     tests/ProcessorStoreInfoTest.cpp
     tests/RAMUsageTest.cpp
+    tests/RenderPlanTest.cpp
     tests/SilenceTest.cpp
     tests/StereoTest.cpp
     tests/UndoRedoTest.cpp

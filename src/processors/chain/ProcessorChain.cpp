@@ -50,9 +50,20 @@ ProcessorChain::ProcessorChain (ProcessorStore& store,
     procs.ensureStorageAllocated (100);
     connections.reserve (100);
     renderPlan.entries.reserve (100);
+
+    renderTask = [this]
+    { renderOnLane(); };
+
+    // for debugging: set BYOD_LANE_LOG to a file path to log which lane each processor runs on
+    if (const auto* laneLogPath = std::getenv ("BYOD_LANE_LOG"))
+        laneLogFile = std::fopen (laneLogPath, "w");
 }
 
-ProcessorChain::~ProcessorChain() = default;
+ProcessorChain::~ProcessorChain()
+{
+    if (laneLogFile != nullptr)
+        std::fclose (laneLogFile);
+}
 
 BaseProcessor* ProcessorChain::getProcessorByID (ProcessorID id)
 {
@@ -107,6 +118,9 @@ void ProcessorChain::prepare (double sampleRate, int samplesPerBlock)
     internalMidiBuffer.clear();
     internalMidiBuffer.ensureSize (256);
 
+    if (! laneGroup.isRunning())
+        laneGroup.start (numLanes);
+
     SpinLock::ScopedLockType scopedProcessingLock (processingLock);
     initializeProcessors();
 }
@@ -116,74 +130,37 @@ void ProcessorChain::reset() noexcept
     ioProcessor.reset();
 }
 
-void ProcessorChain::runProcessor (BaseProcessor* proc, AudioBuffer<float>& buffer, bool& outProcessed)
+void ProcessorChain::runProcessor (const RenderPlanEntry& entry)
 {
     TRACE_DSP();
 
-    int nextNumProcs = 0;
+    auto* proc = entry.processor;
+    auto& laneArena = laneArenas[(size_t) lanes::LaneIdx()];
+    proc->arena = &laneArena;
+
+    if (isLoggingThisBlock)
+        std::fprintf (laneLogFile, "Processing pedal %s on lane %d (thread %p)\n", proc->getName().toRawUTF8(), lanes::LaneIdx(), Thread::getCurrentThreadId());
+
+    if (entry.inputPort < 0)
+    {
+        proc->processAudioBlock (inputBuffer);
+        sendOutputsToNextProcessors (proc, inputBuffer, laneArena);
+    }
+    else
+    {
+        auto buffer = proc->getInputBufferNonConst (entry.inputPort);
+        proc->processAudioBlock (buffer);
+        sendOutputsToNextProcessors (proc, buffer, laneArena);
+    }
+}
+
+void ProcessorChain::sendOutputsToNextProcessors (BaseProcessor* proc, AudioBuffer<float>& buffer, DSPArena& laneArena)
+{
     const int numOutputs = proc->getNumOutputs();
-    int numAudioOutputs = 0;
+
+    int nextNumProcs = 0;
     for (int i = 0; i < numOutputs; ++i)
-    {
-        const int numOutProcs = proc->getNumOutputConnections (i);
-        for (int j = 0; j < numOutProcs; ++j)
-            nextNumProcs += 1;
-
-        numAudioOutputs += proc->getOutputPortType (i) == PortType::audio ? 1 : 0;
-    }
-
-    if (proc == &outputProcessor) // we've reached the output processor, so we're done!
-    {
-        proc->processAudioBlock (buffer);
-        outProcessed = true;
-        return;
-    }
-
-    if (numOutputs == 0) // this processor has no outputs, so after we process, we're done!
-    {
-        proc->processAudioBlock (buffer);
-        return;
-    }
-
-    if (nextNumProcs == 0 && numAudioOutputs > 0) // the output of this processor is connected to nothing, so let's not waste our processing...
-    {
-        if (proc == &inputProcessor)
-            inputProcessor.resetLevels();
-
-        return;
-    }
-
-    proc->processAudioBlock (buffer);
-
-    auto processBuffer = [&] (BaseProcessor* nextProc, int inputIndex, AudioBuffer<float>& nextBuffer)
-    {
-        int nextNumInputs = nextProc->getNumInputs();
-        if (nextNumProcs == 1 && nextNumInputs == 1)
-        {
-            runProcessor (nextProc, nextBuffer, outProcessed);
-        }
-        else if (nextNumProcs > 1 && nextNumInputs == 1)
-        {
-            auto bufferView = arena.alloc_buffer (nextBuffer);
-            chowdsp::BufferMath::copyBufferData (nextBuffer, bufferView);
-            nextProc->getInputBufferView() = bufferView;
-            auto copyNextBuffer = bufferView.toAudioBuffer();
-            runProcessor (nextProc, copyNextBuffer, outProcessed);
-        }
-        else
-        {
-            auto bufferView = arena.alloc_buffer (nextBuffer);
-            chowdsp::BufferMath::copyBufferData (nextBuffer, bufferView);
-            nextProc->getInputBufferView (inputIndex) = bufferView;
-            auto copyNextBuffer = bufferView.toAudioBuffer();
-
-            nextProc->incrementNumInputsReady();
-            if (nextProc->getNumInputsReady() < nextProc->getNumInputConnections())
-                return; // not all the inputs are ready yet...
-
-            runProcessor (nextProc, copyNextBuffer, outProcessed);
-        }
-    };
+        nextNumProcs += proc->getNumOutputConnections (i);
 
     for (int i = 0; i < numOutputs; ++i)
     {
@@ -196,10 +173,51 @@ void ProcessorChain::runProcessor (BaseProcessor* proc, AudioBuffer<float>& buff
         for (int j = numOutProcs - 1; j >= 0; --j)
         {
             const auto& connectionInfo = proc->getOutputConnection (i, j);
-            processBuffer (connectionInfo.endProc, connectionInfo.endPort, outBuffer);
+            auto* nextProc = connectionInfo.endProc;
+
+            if (nextNumProcs == 1 && nextProc->getNumInputs() == 1)
+            {
+                // this is the last processor that needs this buffer, so it can have the buffer itself
+                nextProc->getInputBufferView() = outBuffer;
+            }
+            else
+            {
+                // every other processor gets its own copy
+                auto bufferView = laneArena.alloc_buffer (outBuffer);
+                chowdsp::BufferMath::copyBufferData (outBuffer, bufferView);
+                nextProc->getInputBufferView (connectionInfo.endPort) = bufferView;
+            }
 
             nextNumProcs -= 1;
         }
+    }
+}
+
+void ProcessorChain::renderOnLane()
+{
+    const juce::ScopedNoDenormals noDenormals {};
+
+    if (lanes::LaneIdx() == 0)
+        nextEntryToRun.store (0);
+    lanes::LaneSync();
+
+    for (int stageIndex = 0; stageIndex < renderPlan.getNumStages(); ++stageIndex)
+    {
+        const auto stageEnd = renderPlan.getStageEnd (stageIndex);
+
+        // each lane keeps taking the next processor in the stage until there are none left
+        for (;;)
+        {
+            auto entryIndex = nextEntryToRun.load();
+            if (entryIndex >= stageEnd)
+                break;
+
+            if (nextEntryToRun.compare_exchange_weak (entryIndex, entryIndex + 1))
+                runProcessor (renderPlan.entries[(size_t) entryIndex]);
+        }
+
+        // the next stage needs the output from this one, so wait for all the lanes to finish
+        lanes::LaneSync();
     }
 }
 
@@ -230,33 +248,38 @@ void ProcessorChain::processAudio (AudioBuffer<float>& buffer, const MidiBuffer&
             inputBuffer.copyFrom (ch, 0, osBlock.getChannelPointer ((size_t) ch), osNumSamples);
     }
 
-    bool outProcessed = false;
     const auto& processMidiBuffer = ChainHelperFuncs::getMidiBufferToUse (hostMidiBuffer, internalMidiBuffer, ioProcessor.getOversamplingFactor());
 
     for (auto* processor : procs)
-    {
-        // set up MIDI buffer and arena
         processor->midiBuffer = &processMidiBuffer;
-        processor->arena = &arena;
 
-        // process standalone modulation ports
-        auto noInputsConnected = processor->getNumInputConnections() == 0;
-        auto modOutputConnected = processor->isOutputModulationPortConnected();
-        auto onlyModOut = processor->onlyHasModulationOutput();
-        if (noInputsConnected && (modOutputConnected || onlyModOut))
-            runProcessor (processor, inputBuffer, outProcessed);
-    }
+    // each lane gets its own part of the arena
+    const auto arenaMemory = arena.get_memory_resource();
+    const auto arenaBytesPerLane = arenaMemory.size() / (size_t) numLanes;
+    for (size_t i = 0; i < (size_t) numLanes; ++i)
+        laneArenas[i].get_memory_resource() = arenaMemory.subspan (i * arenaBytesPerLane, arenaBytesPerLane);
+
+    // writing to the log on every block would be way too slow, so we only log one block every so often
+    isLoggingThisBlock = laneLogFile != nullptr && (++numBlocksProcessed % 200 == 0);
+    if (isLoggingThisBlock)
+        std::fprintf (laneLogFile, "--- block %d ---\n", numBlocksProcessed);
 
     // run processing chain
-    runProcessor (&inputProcessor, inputBuffer, outProcessed);
+    if (renderPlan.hasParallelStage() && laneGroup.isRunning())
+        laneGroup.run (renderTask);
+    else
+        renderOnLane();
+
+    if (isLoggingThisBlock)
+        std::fflush (laneLogFile);
 
     for (auto* processor : procs)
-    {
         processor->midiBuffer = nullptr;
-        processor->clearNumInputsReady();
-    }
 
-    if (! outProcessed)
+    if (! renderPlan.processesInput)
+        inputProcessor.resetLevels();
+
+    if (! renderPlan.reachesOutput)
     {
         outputProcessor.resetLevels();
         inputBuffer.clear();
@@ -275,7 +298,8 @@ void ProcessorChain::processAudio (AudioBuffer<float>& buffer, const MidiBuffer&
         }
     }
 
-    arena.clear();
+    for (auto& laneArena : laneArenas)
+        laneArena.clear();
 }
 
 void ProcessorChain::parameterChanged (const juce::String& /*parameterID*/, float /*newValue*/)
@@ -292,7 +316,9 @@ void ProcessorChain::parameterChanged (const juce::String& /*parameterID*/, floa
 void ProcessorChain::fillPlan()
 {
     renderPlan.entries.clear();
+    renderPlan.stageStart.clear();
     renderPlan.reachesOutput = false;
+    renderPlan.processesInput = false;
 
     const auto countConnectionsFrom = [this] (const BaseProcessor* proc)
     {
@@ -315,69 +341,78 @@ void ProcessorChain::fillPlan()
                             { return connection.sourceProcessor == proc->getID() && proc->getOutputPortType (connection.sourcePort) == PortType::modulation; });
     }; 
 
-    std::unordered_map<const BaseProcessor*, int> numInputsDelivered;
-
-    // this must visit the processors in the same order as runProcessor()
-    const auto visitProcessor = [&] (auto&& self, BaseProcessor* proc) -> void
+    // the first stage has the standalone modulation processors and the input processor
+    std::vector<RenderPlanEntry> stage;
+    for (auto* proc : procs)
     {
-        if (proc == &outputProcessor) // we've reached the output processor, so we're done!
+        const auto noInputsConnected = countConnectionsTo (proc) == 0;
+        if (noInputsConnected && (isModulationOutputConnected (proc) || proc->onlyHasModulationOutput()))
+            stage.push_back ({ proc, -1 });
+    }
+    stage.push_back ({ &inputProcessor, -1 });
+
+    std::unordered_map<const BaseProcessor*, int> numInputsDelivered;
+    std::vector<RenderPlanEntry> nextStage;
+
+    while (! stage.empty())
+    {
+        const auto stageStartIndex = (int) renderPlan.entries.size();
+
+        for (const auto& entry : stage)
         {
-            renderPlan.entries.push_back ({ proc });
-            renderPlan.reachesOutput = true;
-            return;
-        }
+            auto* proc = entry.processor;
 
-        const auto numOutputs = proc->getNumOutputs();
-        if (numOutputs == 0) // this processor has no outputs, so after we process, we're done!
-        {
-            renderPlan.entries.push_back ({ proc });
-            return;
-        }
-
-        int numAudioOutputs = 0;
-        for (int portIdx = 0; portIdx < numOutputs; ++portIdx)
-            numAudioOutputs += proc->getOutputPortType (portIdx) == PortType::audio ? 1 : 0;
-
-        if (countConnectionsFrom (proc) == 0 && numAudioOutputs > 0) // the output of this processor is connected to nothing, so it doesn't run
-            return;
-
-        renderPlan.entries.push_back ({ proc });
-
-        for (int portIdx = 0; portIdx < numOutputs; ++portIdx)
-        {
-            // the connections on each port are visited from the most recently added to the least
-            for (auto connection = connections.rbegin(); connection != connections.rend(); ++connection)
+            if (proc == &outputProcessor) // we've reached the output processor, so we're done!
             {
-                if (connection->sourceProcessor != proc->getID() || connection->sourcePort != portIdx)
+                renderPlan.entries.push_back (entry);
+                renderPlan.reachesOutput = true;
+                continue;
+            }
+
+            const auto numOutputs = proc->getNumOutputs();
+            if (numOutputs == 0) // this processor has no outputs, so after we process, we're done!
+            {
+                renderPlan.entries.push_back (entry);
+                continue;
+            }
+
+            int numAudioOutputs = 0;
+            for (int portIdx = 0; portIdx < numOutputs; ++portIdx)
+                numAudioOutputs += proc->getOutputPortType (portIdx) == PortType::audio ? 1 : 0;
+
+            if (countConnectionsFrom (proc) == 0 && numAudioOutputs > 0) // the output of this processor is connected to nothing, so it doesn't run
+                continue;
+
+            renderPlan.entries.push_back (entry);
+            if (proc == &inputProcessor)
+                renderPlan.processesInput = true;
+
+            // a processor goes in the next stage once all of its inputs are ready
+            for (const auto& connection : connections)
+            {
+                if (connection.sourceProcessor != proc->getID())
                     continue;
 
-                auto* nextProc = getProcessorByID (connection->destinationProcessor);
+                auto* nextProc = getProcessorByID (connection.destinationProcessor);
                 if (nextProc == nullptr)
                 {
                     jassertfalse; // the connection table has a processor that isn't in the chain!
                     continue;
                 }
 
-                if (nextProc->getNumInputs() != 1)
-                {
-                    if (++numInputsDelivered[nextProc] < countConnectionsTo (nextProc))
-                        continue; // not all the inputs are ready yet...
-                }
+                if (++numInputsDelivered[nextProc] < countConnectionsTo (nextProc))
+                    continue; // not all the inputs are ready yet...
 
-                self (self, nextProc);
+                nextStage.push_back ({ nextProc, connection.destinationPort });
             }
         }
-    };
 
-    // standalone modulation processors
-    for (auto* proc : procs)
-    {
-        const auto noInputsConnected = countConnectionsTo (proc) == 0;
-        if (noInputsConnected && (isModulationOutputConnected (proc) || proc->onlyHasModulationOutput()))
-            visitProcessor (visitProcessor, proc);
+        if ((int) renderPlan.entries.size() > stageStartIndex)
+            renderPlan.stageStart.push_back (stageStartIndex);
+
+        stage = nextStage;
+        nextStage.clear();
     }
-
-    visitProcessor (visitProcessor, &inputProcessor);
 }
 
 size_t ProcessorChain::getRequiredArenaSizeBytes()
@@ -393,7 +428,8 @@ size_t ProcessorChain::getRequiredArenaSizeBytes()
     static constexpr size_t blockSize = 8192;
     const auto totalNumBytes = chowdsp::Math::round_to_next_multiple (ioBufferBytes, blockSize);
 
-    return totalNumBytes;
+    // each lane needs enough space to do all of the processing by itself
+    return totalNumBytes * (size_t) numLanes;
 }
 
 bool ProcessorChain::needsNewArena (size_t requiredBytes) const

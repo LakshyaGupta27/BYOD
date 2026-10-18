@@ -204,10 +204,6 @@ public:
     int getNumOutputConnections (int portIdx) const { return outputConnections[(size_t) portIdx].size(); }
     int getNumInputConnections() const { return inputsConnected.size(); }
 
-    int incrementNumInputsReady() { return numInputsReady++; }
-    int getNumInputsReady() const { return numInputsReady; }
-    void clearNumInputsReady() { numInputsReady = 0; }
-
     void addConnection (ConnectionInfo&& info);
     void removeConnection (const ConnectionInfo& info);
     virtual void inputConnectionChanged (int /*portIndex*/, bool /*wasConnected*/) {}
@@ -325,7 +321,6 @@ private:
 
     std::vector<Array<ConnectionInfo>> outputConnections;
     Array<chowdsp::BufferView<float>> inputBuffers;
-    int numInputsReady = 0;
 
     juce::Point<float> editorPosition;
 

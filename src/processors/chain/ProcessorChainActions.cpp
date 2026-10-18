@@ -33,6 +33,7 @@ public:
         {
             SpinLock::ScopedLockType scopedProcessingLock { chain.processingLock };
             newProcPtr = chain.procs.add (std::move (newProc));
+            chain.fillPlan();
         }
 
         for (auto* param : newProcPtr->getParameters())
@@ -61,6 +62,7 @@ public:
         {
             SpinLock::ScopedLockType scopedProcessingLock { chain.processingLock };
             saveProc.reset (chain.procs.removeAndReturn (chain.procs.indexOf (procToRemove)));
+            chain.fillPlan();
         }
         saveProc->freeInternalMemory();
     }
@@ -83,6 +85,7 @@ public:
             SpinLock::ScopedLockType scopedProcessingLock { chain.processingLock };
             info.startProc->addConnection (ConnectionInfo (info));
             chain.connections.push_back (connection);
+            chain.fillPlan();
             if (needsNewArena)
                 std::swap (arenaData, chain.arena.get_memory_resource());
         }
@@ -113,6 +116,7 @@ public:
             else
                 jassertfalse; // the connection table is out of sync with the processors!
 
+            chain.fillPlan();
             if (needsNewArena)
                 std::swap (arenaData, chain.arena.get_memory_resource());
         }
