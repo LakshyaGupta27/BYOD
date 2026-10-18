@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -22,21 +23,7 @@ class Barrier
 public:
     explicit Barrier (int numLanesToWaitFor) : numLanes (numLanesToWaitFor) {}
 
-    void wait()
-    {
-        const auto round = roundsDone.load();
-        if (numArrived.fetch_add (1) + 1 == numLanes)
-        {
-            // we're the last lane to arrive, so let everyone go
-            numArrived.store (0);
-            roundsDone.fetch_add (1);
-            return;
-        }
-
-        // spin instead of sleeping, since we might be on the audio thread
-        while (roundsDone.load() == round)
-            std::this_thread::yield();
-    }
+    void wait();
 
 private:
     const int numLanes;
@@ -44,64 +31,30 @@ private:
     std::atomic<int> roundsDone { 0 };
 };
 
-struct LaneContext
-{
-    int index = 0;
-    Barrier* barrier = nullptr;
-};
-
-// a thread that isn't part of a group acts like a group with one lane
-inline thread_local LaneContext laneContext;
-
 /** Returns the index of the lane that we're running on. */
-inline int LaneIdx() noexcept { return laneContext.index; }
+int LaneIdx() noexcept;
 
 /** Waits here until all the other lanes in the group have arrived. */
-inline void LaneSync()
-{
-    if (laneContext.barrier != nullptr)
-        laneContext.barrier->wait();
-}
+void LaneSync();
 
 /** A group of lanes. The threads are created once and then sleep until there is a task to run. */
 class LaneGroup
 {
 public:
-    ~LaneGroup() { stop(); }
+    ~LaneGroup();
 
     /** The thread that calls run() is lane 0, so this makes (numLanes - 1) threads. */
-    void start (int numLanes)
-    {
-        stop();
-
-        barrier = std::make_unique<Barrier> (numLanes);
-        shouldStop = false;
-
-        for (int laneIndex = 1; laneIndex < numLanes; ++laneIndex)
-            threads.emplace_back ([this, laneIndex] { threadLoop (laneIndex); });
-    }
-
-    void stop()
-    {
-        {
-            const std::lock_guard lock { mutex };
-            shouldStop = true;
-        }
-        wakeUp.notify_all();
-
-        for (auto& thread : threads)
-            thread.join();
-        threads.clear();
-    }
+    void start (int numLanes);
+    void stop();
 
     bool isRunning() const noexcept { return ! threads.empty(); }
 
+    /** Runs the task on every lane at the same time, and returns once all the lanes have finished. */
+    void run (const std::function<void()>& taskToRun);
+
 private:
-    void threadLoop (int laneIndex) // laneIndex gets used in the next step
-    {
-        std::unique_lock lock { mutex };
-        wakeUp.wait (lock, [this] { return shouldStop; });
-    }
+    void threadLoop (int laneIndex);
+    void runTaskOnLane (int laneIndex);
 
     std::unique_ptr<Barrier> barrier;
     std::vector<std::thread> threads;
@@ -109,5 +62,8 @@ private:
     std::mutex mutex;
     std::condition_variable wakeUp;
     bool shouldStop = false;
+    int runCount = 0;
+    const std::function<void()>* task = nullptr;
+    std::atomic<int> numThreadsRunning { 0 };
 };
 } // namespace lanes

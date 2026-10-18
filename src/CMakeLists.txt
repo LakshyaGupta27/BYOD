@@ -55,6 +55,7 @@ target_sources(BYOD PRIVATE
     
     processors/chain/ChainIOProcessor.cpp
     processors/chain/DryWetProcessor.cpp
+    processors/chain/Lanes.cpp
     processors/chain/ProcessorChain.cpp
     processors/chain/ProcessorChainActions.cpp
     processors/chain/ProcessorChainActionHelper.cpp
